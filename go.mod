@@ -1,4 +1,4 @@
-module github.com/kvtools/consul
+module github.com/jonasohland/valkeyrie-store-consul
 
 go 1.19
 
