@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -88,7 +89,7 @@ func New(_ context.Context, endpoints []string, options *Config) (*Store, error)
 
 // Get the value at "key".
 // Returns the last modified index to use in conjunction to CAS calls.
-func (s *Store) Get(_ context.Context, key string, opts *store.ReadOptions) (*store.KVPair, error) {
+func (s *Store) Get(ctx context.Context, key string, opts *store.ReadOptions) (*store.KVPair, error) {
 	options := &api.QueryOptions{
 		AllowStale:        false,
 		RequireConsistent: true,
@@ -99,7 +100,7 @@ func (s *Store) Get(_ context.Context, key string, opts *store.ReadOptions) (*st
 		options.RequireConsistent = opts.Consistent
 	}
 
-	pair, meta, err := s.client.KV().Get(normalize(key), options)
+	pair, meta, err := s.client.KV().Get(normalize(key), options.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +114,7 @@ func (s *Store) Get(_ context.Context, key string, opts *store.ReadOptions) (*st
 }
 
 // Put a value at "key".
-func (s *Store) Put(_ context.Context, key string, value []byte, opts *store.WriteOptions) error {
+func (s *Store) Put(ctx context.Context, key string, value []byte, opts *store.WriteOptions) error {
 	p := &api.KVPair{
 		Key:   normalize(key),
 		Value: value,
@@ -121,6 +122,10 @@ func (s *Store) Put(_ context.Context, key string, value []byte, opts *store.Wri
 	}
 
 	if opts != nil && opts.TTL > 0 {
+		if opts.TTL < 10*time.Second {
+			opts.TTL = 10 * time.Second
+		}
+
 		// Create or renew a session holding a TTL.
 		// Operations on sessions are not deterministic: creating or renewing a session can fail.
 		for retry := 1; retry <= RenewSessionRetryMax; retry++ {
@@ -134,7 +139,7 @@ func (s *Store) Put(_ context.Context, key string, value []byte, opts *store.Wri
 		}
 	}
 
-	_, err := s.client.KV().Put(p, nil)
+	_, err := s.client.KV().Put(p, (&api.WriteOptions{}).WithContext(ctx))
 	return err
 }
 
@@ -161,7 +166,7 @@ func (s *Store) Exists(ctx context.Context, key string, opts *store.ReadOptions)
 }
 
 // List child nodes of a given directory.
-func (s *Store) List(_ context.Context, directory string, opts *store.ReadOptions) ([]*store.KVPair, error) {
+func (s *Store) List(ctx context.Context, directory string, opts *store.ReadOptions) ([]*store.KVPair, error) {
 	options := &api.QueryOptions{
 		AllowStale:        false,
 		RequireConsistent: true,
@@ -172,7 +177,7 @@ func (s *Store) List(_ context.Context, directory string, opts *store.ReadOption
 		options.RequireConsistent = false
 	}
 
-	pairs, _, err := s.client.KV().List(normalize(directory), options)
+	pairs, _, err := s.client.KV().List(normalize(directory), options.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +207,7 @@ func (s *Store) DeleteTree(ctx context.Context, directory string) error {
 		return err
 	}
 
-	_, err := s.client.KV().DeleteTree(normalize(directory), nil)
+	_, err := s.client.KV().DeleteTree(normalize(directory), (&api.WriteOptions{}).WithContext(ctx))
 	return err
 }
 
@@ -229,7 +234,7 @@ func (s *Store) Watch(ctx context.Context, key string, _ *store.ReadOptions) (<-
 			}
 
 			// Get the key.
-			pair, meta, err := kv.Get(key, opts)
+			pair, meta, err := kv.Get(key, opts.WithContext(ctx))
 			if err != nil {
 				return
 			}
@@ -277,7 +282,7 @@ func (s *Store) WatchTree(ctx context.Context, directory string, _ *store.ReadOp
 			}
 
 			// Get all the children.
-			pairs, meta, err := kv.List(directory, opts)
+			pairs, meta, err := kv.List(directory, opts.WithContext(ctx))
 			if err != nil {
 				return
 			}
@@ -320,6 +325,10 @@ func (s *Store) NewLock(ctx context.Context, key string, opts *store.LockOptions
 		// Set optional TTL on Lock.
 		if opts.TTL != 0 {
 			ttl = opts.TTL
+
+			if ttl < 10*time.Second {
+				ttl = 10 * time.Second
+			}
 		}
 		// Set optional value on Lock.
 		if opts.Value != nil {
@@ -430,7 +439,7 @@ func (s *Store) AtomicPut(ctx context.Context, key string, value []byte, previou
 		p.ModifyIndex = previous.LastIndex
 	}
 
-	ok, _, err := s.client.KV().CAS(p, nil)
+	ok, _, err := s.client.KV().CAS(p, (&api.WriteOptions{}).WithContext(ctx))
 	if err != nil {
 		return false, nil, err
 	}
@@ -464,7 +473,7 @@ func (s *Store) AtomicDelete(ctx context.Context, key string, previous *store.KV
 		return false, err
 	}
 
-	if work, _, err := s.client.KV().DeleteCAS(p, nil); err != nil {
+	if work, _, err := s.client.KV().DeleteCAS(p, (&api.WriteOptions{}).WithContext(ctx)); err != nil {
 		return false, err
 	} else if !work {
 		return false, store.ErrKeyModified
@@ -484,10 +493,16 @@ func (s *Store) renewSession(pair *api.KVPair, ttl time.Duration) error {
 	}
 
 	if session == "" {
+		if ttl < 20*time.Second {
+			ttl = 10 * time.Second
+		} else {
+			ttl /= 2
+		}
+
 		entry := &api.SessionEntry{
 			Behavior:  api.SessionBehaviorDelete, // Delete the key when the session expires.
-			TTL:       (ttl / 2).String(),        // Consul multiplies the TTL by 2x.
-			LockDelay: 1 * time.Millisecond,      // Virtually disable lock delay.
+			TTL:       ttl.String(),
+			LockDelay: 1 * time.Millisecond, // Virtually disable lock delay.
 		}
 
 		// Create the key session.
